@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+pragma solidity ^0.8.17;
+
+import {IPrigeeXV2Pair} from '@prigeex/v2-core/contracts/interfaces/IPrigeeXV2Pair.sol';
+import {UniswapV2Library} from './UniswapV2Library.sol';
+import {UniswapImmutables} from '../UniswapImmutables.sol';
+import {Payments} from '../../Payments.sol';
+import {Permit2Payments} from '../../Permit2Payments.sol';
+import {Constants} from '../../../libraries/Constants.sol';
+import {IERC20} from '@openzeppelin/contracts-v4/token/ERC20/IERC20.sol';
+
+/// @title Router for PrigeeX V2 Trades
+abstract contract V2SwapRouter is UniswapImmutables, Permit2Payments {
+    error V2TooLittleReceived();
+    error V2TooMuchRequested();
+    error V2InvalidPath();
+
+    function _v2Swap(address[] calldata path, address recipient, address pair) private {
+        unchecked {
+            if (path.length < 2) revert V2InvalidPath();
+
+            (address token0,) = UniswapV2Library.sortTokens(path[0], path[1]);
+            uint256 finalPairIndex = path.length - 1;
+            uint256 penultimatePairIndex = finalPairIndex - 1;
+            for (uint256 i; i < finalPairIndex; i++) {
+                (address input, address output) = (path[i], path[i + 1]);
+                (uint256 reserve0, uint256 reserve1,) = IPrigeeXV2Pair(pair).getReserves();
+                (uint256 reserveInput, uint256 reserveOutput) =
+                    input == token0 ? (reserve0, reserve1) : (reserve1, reserve0);
+                uint256 amountInput = IERC20(input).balanceOf(pair) - reserveInput;
+                uint256 amountOutput = UniswapV2Library.getAmountOut(amountInput, reserveInput, reserveOutput);
+                (uint256 amount0Out, uint256 amount1Out) =
+                    input == token0 ? (uint256(0), amountOutput) : (amountOutput, uint256(0));
+                address nextPair;
+                (nextPair, token0) = i < penultimatePairIndex
+                    ? UniswapV2Library.pairAndToken0For(
+                        PRIGEEX_V2_FACTORY, PRIGEEX_V2_PAIR_INIT_CODE_HASH, output, path[i + 2]
+                    )
+                    : (recipient, address(0));
+                IPrigeeXV2Pair(pair).swap(amount0Out, amount1Out, nextPair, new bytes(0));
+                pair = nextPair;
+            }
+        }
+    }
+
+    function v2SwapExactInput(
+        address recipient,
+        uint256 amountIn,
+        uint256 amountOutMinimum,
+        address[] calldata path,
+        address payer
+    ) internal {
+        address firstPair =
+            UniswapV2Library.pairFor(PRIGEEX_V2_FACTORY, PRIGEEX_V2_PAIR_INIT_CODE_HASH, path[0], path[1]);
+        if (amountIn != Constants.ALREADY_PAID) {
+            payOrPermit2Transfer(path[0], payer, firstPair, amountIn);
+        }
+
+        uint256 balanceBefore = IERC20(path[path.length - 1]).balanceOf(recipient);
+        _v2Swap(path, recipient, firstPair);
+        uint256 amountOut = IERC20(path[path.length - 1]).balanceOf(recipient) - balanceBefore;
+        if (amountOut < amountOutMinimum) revert V2TooLittleReceived();
+    }
+
+    function v2SwapExactOutput(
+        address recipient,
+        uint256 amountOut,
+        uint256 amountInMaximum,
+        address[] calldata path,
+        address payer
+    ) internal {
+        (uint256 amountIn, address firstPair) =
+            UniswapV2Library.getAmountInMultihop(PRIGEEX_V2_FACTORY, PRIGEEX_V2_PAIR_INIT_CODE_HASH, amountOut, path);
+        if (amountIn > amountInMaximum) revert V2TooMuchRequested();
+
+        payOrPermit2Transfer(path[0], payer, firstPair, amountIn);
+        _v2Swap(path, recipient, firstPair);
+    }
+}
